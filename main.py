@@ -13,7 +13,8 @@ from openpyxl.utils import get_column_letter
 # ═══════════════════════════════════════════════════════════
 POLL_INTERVAL       = int(os.getenv('POLL_INTERVAL', 60))
 LEADERBOARD_REFRESH = int(os.getenv('LEADERBOARD_REFRESH', 30))
-TOP_N               = int(os.getenv('TOP_N', 20))
+# Expanded TOP_N to 100 per category (~700 unique wallets total)
+TOP_N               = int(os.getenv('TOP_N', 100))
 MIN_POSITION_USD    = float(os.getenv('MIN_POSITION_USD', 10))
 PAPER_BALANCE       = float(os.getenv('PAPER_BALANCE', 1000.0))
 BET_SIZE_PCT        = float(os.getenv('BET_SIZE_PCT', 0.05))
@@ -40,7 +41,7 @@ def log(msg):
 # GITHUB UPLOAD
 # ═══════════════════════════════════════════════════════════
 
-def upload_to_github(file_path, commit_msg="update excel"):
+def upload_to_github(file_path, commit_msg="Hourly Excel Sync"):
     if not GITHUB_TOKEN or not GITHUB_REPO:
         log("⚠️ GitHub not configured. Skipping upload.")
         return
@@ -56,7 +57,6 @@ def upload_to_github(file_path, commit_msg="update excel"):
             "Accept": "application/vnd.github.v3+json"
         }
 
-        # check existing file
         res = requests.get(url, headers=headers)
         sha = res.json().get("sha") if res.status_code == 200 else None
 
@@ -71,7 +71,7 @@ def upload_to_github(file_path, commit_msg="update excel"):
         res = requests.put(url, headers=headers, json=data)
 
         if res.status_code in [200, 201]:
-            log("☁️ Excel uploaded to GitHub")
+            log("☁️ Excel successfully synced to GitHub")
         else:
             log(f"❌ GitHub upload failed: {res.text}")
 
@@ -385,6 +385,9 @@ def main():
     log(f'✅ Ready. Watching {len(watch_list)} wallets. Starting monitor loop...\n')
 
     cycle = 0
+    # Initialize the time tracker for 1-hour GitHub pushes
+    last_github_push = time.time()
+
     while True:
         cycle += 1
         now_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
@@ -493,9 +496,12 @@ def main():
             f'P&L:${total_pnl:+,.2f}'
             + (f' | ⚡{events}' if events else ''))
 
-        # 🔥 Upload every 5 cycles
-        if cycle % 5 == 0:
+        # 🔥 Time-based hourly push to GitHub
+        # 3600 seconds = 1 hour
+        if time.time() - last_github_push >= 3600:
+            log("⏳ 1 hour elapsed, triggering GitHub push...")
             upload_to_github(EXCEL_FILE)
+            last_github_push = time.time()
 
         time.sleep(POLL_INTERVAL)
 
