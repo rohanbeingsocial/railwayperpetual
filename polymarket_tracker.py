@@ -1,12 +1,9 @@
 """
 Polymarket Wallet Tracker & Market Predictor
-Tracks wallet trade history and predicts next market investments.
+Uses public Data API (no auth needed).
 
 Requirements:
     pip install requests pandas openpyxl python-dotenv schedule
-
-Usage:
-    python polymarket_tracker.py
 
 Railway setup:
     - Mount a persistent volume at /data
@@ -14,16 +11,13 @@ Railway setup:
 """
 
 import os
-import json
 import time
 import requests
 import pandas as pd
 from datetime import datetime, timezone
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from collections import defaultdict, Counter
-import schedule
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -36,372 +30,343 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/data")
 EXCEL_PATH = os.path.join(OUTPUT_DIR, "polymarket_tracker.xlsx")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Polymarket endpoints
-CLOB_API       = "https://clob.polymarket.com"
-GAMMA_API      = "https://gamma-api.polymarket.com"
-SUBGRAPH_URL   = "https://api.thegraph.com/subgraphs/name/polymarket/matic-markets"
+DATA_API  = "https://data-api.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+HEADERS   = {"Accept": "application/json"}
 
-HEADERS = {"Accept": "application/json"}
+# ── Fetch ─────────────────────────────────────────────────────────────────────
 
-# ── Data Fetching ──────────────────────────────────────────────────────────────
+def get_json(url, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            print(f"    [retry {attempt+1}] {url} — {e}")
+            time.sleep(2 ** attempt)
+    return None
 
-def fetch_trades_clob(wallet: str) -> list[dict]:
-    """Fetch trade history from Polymarket CLOB API."""
+
+def fetch_trades(wallet: str) -> list:
+    """
+    Fetch all trades for a wallet from the public Data API.
+    Endpoint: GET /trades?user=<wallet>&limit=500&offset=N
+    Response fields: proxyWallet, side, price, size, outcome, timestamp,
+                     conditionId, transactionHash, market (slug)
+    """
     trades = []
-    next_cursor = None
+    offset = 0
+    limit  = 500
 
     while True:
-        params = {"maker_address": wallet.lower(), "limit": 500}
-        if next_cursor:
-            params["next_cursor"] = next_cursor
-
-        try:
-            r = requests.get(f"{CLOB_API}/trades", params=params, headers=HEADERS, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            print(f"  [CLOB] Error fetching trades for {wallet}: {e}")
+        data = get_json(f"{DATA_API}/trades", params={
+            "user":   wallet.lower(),
+            "limit":  limit,
+            "offset": offset,
+        })
+        if not data or not isinstance(data, list):
             break
-
-        batch = data.get("data", [])
-        trades.extend(batch)
-
-        next_cursor = data.get("next_cursor")
-        if not next_cursor or next_cursor == "LTE=":
+        trades.extend(data)
+        print(f"    Fetched {len(trades)} trades so far...")
+        if len(data) < limit:
             break
-        time.sleep(0.3)
+        offset += limit
+        time.sleep(0.4)
 
     return trades
 
 
-def fetch_positions_gamma(wallet: str) -> list[dict]:
-    """Fetch open/closed positions from Gamma API."""
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/positions",
-            params={"user": wallet.lower(), "limit": 500},
-            headers=HEADERS,
-            timeout=15,
-        )
-        r.raise_for_status()
-        return r.json() if isinstance(r.json(), list) else r.json().get("data", [])
-    except Exception as e:
-        print(f"  [Gamma] Error fetching positions for {wallet}: {e}")
-        return []
-
-
 def fetch_market_info(condition_id: str) -> dict:
-    """Fetch market metadata from Gamma API."""
-    try:
-        r = requests.get(
-            f"{GAMMA_API}/markets",
-            params={"condition_id": condition_id},
-            headers=HEADERS,
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list) and data:
-            return data[0]
-        elif isinstance(data, dict):
-            return data.get("data", [{}])[0] if data.get("data") else {}
-    except Exception:
-        pass
+    """Fetch market metadata — question, end date, outcomes."""
+    if not condition_id:
+        return {}
+    data = get_json(f"{GAMMA_API}/markets", params={"conditionId": condition_id})
+    if isinstance(data, list) and data:
+        return data[0]
     return {}
 
 
-# ── Analysis ───────────────────────────────────────────────────────────────────
+# ── Parse & Enrich ────────────────────────────────────────────────────────────
 
-def parse_trades(raw_trades: list[dict], wallet: str) -> pd.DataFrame:
-    """Normalize raw trade data into a clean DataFrame."""
+def parse_trades(raw: list, wallet: str) -> pd.DataFrame:
     rows = []
-    for t in raw_trades:
+    for t in raw:
         try:
+            # Data API timestamps can be seconds or milliseconds
+            ts = int(t.get("timestamp", 0) or 0)
+            if ts > 9_999_999_999:
+                ts = ts // 1000
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
+
+            price = float(t.get("price", 0) or 0)
+            size  = float(t.get("size",  0) or 0)
+
             rows.append({
-                "wallet":        wallet,
-                "trade_id":      t.get("id", ""),
-                "timestamp":     datetime.fromtimestamp(
-                                     int(t.get("created_at", 0) or 0), tz=timezone.utc
-                                 ),
-                "market_id":     t.get("market", ""),
-                "condition_id":  t.get("condition_id", ""),
-                "side":          t.get("side", "").upper(),           # BUY / SELL
-                "outcome":       t.get("outcome", ""),               # YES / NO
-                "price":         float(t.get("price", 0) or 0),      # 0-1 scale
-                "size":          float(t.get("size", 0) or 0),       # USDC
-                "status":        t.get("status", ""),
-                "asset_id":      t.get("asset_id", ""),
+                "wallet":       wallet,
+                "timestamp":    dt,
+                "side":         (t.get("side") or "").upper(),
+                "outcome":      t.get("outcome") or t.get("name") or "",
+                "price":        price,
+                "implied_prob": round(price * 100, 1),
+                "size_usdc":    size,
+                "value_usdc":   round(price * size, 2),
+                "condition_id": t.get("conditionId") or t.get("market") or "",
+                "tx_hash":      t.get("transactionHash") or "",
+                "market_name":  "",   # filled below
             })
         except Exception:
             continue
+
     df = pd.DataFrame(rows)
     if not df.empty:
         df.sort_values("timestamp", ascending=False, inplace=True)
     return df
 
 
-def enrich_with_market_names(df: pd.DataFrame) -> pd.DataFrame:
-    """Add market question/name column by looking up unique condition IDs."""
+def enrich_market_names(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
-
-    unique_cids = df["condition_id"].dropna().unique()
-    cid_to_name = {}
-
-    print(f"  Fetching metadata for {len(unique_cids)} markets...")
+    unique_cids = [c for c in df["condition_id"].unique() if c]
+    print(f"    Fetching names for {len(unique_cids)} markets...")
+    cid_map = {}
     for cid in unique_cids:
-        if not cid:
-            continue
         info = fetch_market_info(cid)
-        cid_to_name[cid] = info.get("question") or info.get("title") or cid[:20]
+        cid_map[cid] = info.get("question") or info.get("title") or cid[:20]
         time.sleep(0.2)
-
-    df["market_name"] = df["condition_id"].map(cid_to_name).fillna("Unknown")
+    df["market_name"] = df["condition_id"].map(cid_map).fillna("Unknown")
     return df
 
 
-def compute_wallet_stats(df: pd.DataFrame) -> dict:
-    """Compute summary statistics per wallet."""
-    if df.empty:
-        return {}
+# ── Stats & Predictions ───────────────────────────────────────────────────────
 
+def wallet_stats(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {"note": "No trades found"}
     buys  = df[df["side"] == "BUY"]
     sells = df[df["side"] == "SELL"]
-
     return {
         "total_trades":    len(df),
-        "total_buy_vol":   buys["size"].sum(),
-        "total_sell_vol":  sells["size"].sum(),
+        "buy_volume_usdc": round(buys["size_usdc"].sum(), 2),
+        "sell_volume_usdc":round(sells["size_usdc"].sum(), 2),
         "unique_markets":  df["condition_id"].nunique(),
-        "avg_buy_price":   buys["price"].mean() if not buys.empty else 0,
-        "avg_sell_price":  sells["price"].mean() if not sells.empty else 0,
+        "avg_buy_price":   round(buys["price"].mean(), 4) if not buys.empty else 0,
+        "avg_sell_price":  round(sells["price"].mean(), 4) if not sells.empty else 0,
         "first_trade":     df["timestamp"].min(),
         "last_trade":      df["timestamp"].max(),
-        "fav_outcome":     df["outcome"].mode()[0] if not df["outcome"].empty else "N/A",
     }
 
 
-def predict_next_markets(df: pd.DataFrame, top_n: int = 5) -> pd.DataFrame:
-    """
-    Heuristic prediction of next likely markets and entry prices.
-
-    Signals used:
-      1. Category/tag frequency — wallets tend to specialise
-      2. Recency-weighted market revisit probability
-      3. Average entry price per market → likely next entry range
-      4. Win-rate on outcome side (YES/NO preference)
-    """
-    if df.empty:
+def predict_next_markets(df: pd.DataFrame, top_n=10) -> pd.DataFrame:
+    if df.empty or "market_name" not in df.columns:
         return pd.DataFrame()
 
-    # Recency weight: exponential decay over days
     now = datetime.now(tz=timezone.utc)
-    df = df.copy()
+    df  = df.copy()
     df["days_ago"] = (now - df["timestamp"]).dt.total_seconds() / 86400
     df["weight"]   = df["days_ago"].apply(lambda d: 0.95 ** d)
 
-    # Weighted score per market
-    mkt_scores = (
-        df.groupby(["condition_id", "market_name"])
-        .agg(
-            total_weight    = ("weight", "sum"),
-            trade_count     = ("trade_id", "count"),
-            avg_buy_price   = ("price", lambda x: x[df.loc[x.index, "side"] == "BUY"].mean() if (df.loc[x.index, "side"] == "BUY").any() else None),
-            last_trade_date = ("timestamp", "max"),
-            net_usdc        = ("size", lambda x: x[df.loc[x.index, "side"] == "BUY"].sum() - x[df.loc[x.index, "side"] == "SELL"].sum()),
-            yes_pct         = ("outcome", lambda x: (x == "YES").mean()),
-        )
-        .reset_index()
+    grp = df.groupby(["condition_id", "market_name"])
+
+    def avg_buy_price(g):
+        buys = g[g["side"] == "BUY"]["price"]
+        return buys.mean() if not buys.empty else None
+
+    def net_usdc(g):
+        b = g[g["side"] == "BUY"]["size_usdc"].sum()
+        s = g[g["side"] == "SELL"]["size_usdc"].sum()
+        return b - s
+
+    scores = grp.apply(lambda g: pd.Series({
+        "total_weight":    g["weight"].sum(),
+        "trade_count":     len(g),
+        "avg_buy_price":   avg_buy_price(g),
+        "net_usdc":        net_usdc(g),
+        "last_trade":      g["timestamp"].max(),
+        "yes_pct":         (g["outcome"] == "YES").mean(),
+    })).reset_index()
+
+    # Focus on markets they've exited (likely to re-enter similar ones)
+    closed = scores[scores["net_usdc"] <= 5].copy()
+    closed["score"] = closed["total_weight"] * 0.6 + closed["trade_count"] * 0.4
+    closed = closed.sort_values("score", ascending=False).head(top_n)
+
+    closed["predicted_entry"] = closed["avg_buy_price"].apply(
+        lambda p: f"{p:.2f}  ({p*100:.0f}¢)" if pd.notna(p) else "N/A"
     )
+    closed["likely_outcome"] = (closed["yes_pct"] >= 0.5).map({True: "YES", False: "NO"})
 
-    # Markets still open (net positive USDC in = more bought than sold)
-    open_positions  = mkt_scores[mkt_scores["net_usdc"] > 5].copy()
-    closed_markets  = mkt_scores[mkt_scores["net_usdc"] <= 5].copy()
-
-    # Predict: frequently re-entered closed markets are likely candidates
-    closed_markets["prediction_score"] = (
-        closed_markets["total_weight"] * 0.6 +
-        closed_markets["trade_count"]  * 0.4
-    )
-    predictions = closed_markets.sort_values("prediction_score", ascending=False).head(top_n)
-
-    predictions["predicted_entry_odds"] = predictions["avg_buy_price"].apply(
-        lambda p: f"{p:.2f} ({p*100:.0f}¢)" if pd.notna(p) else "N/A"
-    )
-    predictions["likely_outcome"] = (predictions["yes_pct"] >= 0.5).map({True: "YES", False: "NO"})
-
-    return predictions[[
+    return closed[[
         "market_name", "condition_id", "trade_count",
-        "last_trade_date", "predicted_entry_odds",
-        "likely_outcome", "prediction_score"
+        "last_trade", "predicted_entry", "likely_outcome", "score"
     ]].rename(columns={
-        "market_name":          "Market",
-        "condition_id":         "Condition ID",
-        "trade_count":          "Historical Trades",
-        "last_trade_date":      "Last Seen",
-        "predicted_entry_odds": "Predicted Entry (odds)",
-        "likely_outcome":       "Likely Outcome",
-        "prediction_score":     "Confidence Score",
+        "market_name":    "Market",
+        "condition_id":   "Condition ID",
+        "trade_count":    "Historical Trades",
+        "last_trade":     "Last Seen",
+        "predicted_entry":"Predicted Entry (odds)",
+        "likely_outcome": "Likely Outcome",
+        "score":          "Confidence Score",
     })
 
 
-# ── Excel Output ───────────────────────────────────────────────────────────────
+# ── Excel ─────────────────────────────────────────────────────────────────────
 
-BLUE   = "FF003087"
-GOLD   = "FFFFD700"
-LGREEN = "FFD9F0D9"
-WHITE  = "FFFFFFFF"
-LGRAY  = "FFF2F2F2"
+NAVY  = "1F3864"
+GOLD  = "FFD700"
+GREEN = "E2EFDA"
+RED   = "FCE4D6"
+GRAY  = "F5F5F5"
 
-def _header_style(cell, bg=BLUE, fg=WHITE):
-    cell.font      = Font(bold=True, color=fg, size=11)
+def hdr(cell, bg=NAVY, fg="FFFFFF"):
+    cell.font      = Font(bold=True, color=fg, size=10)
     cell.fill      = PatternFill("solid", start_color=bg)
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin = Side(style="thin", color="CCCCCC")
+    cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-def _thin_border():
-    s = Side(style="thin", color="FFCCCCCC")
-    return Border(left=s, right=s, top=s, bottom=s)
+def data_cell(cell, val, row_idx, side=None):
+    thin = Side(style="thin", color="CCCCCC")
+    if side == "BUY":
+        fill = GREEN
+    elif side == "SELL":
+        fill = RED
+    else:
+        fill = GRAY if row_idx % 2 == 0 else "FFFFFF"
+    if isinstance(val, datetime):
+        val = val.strftime("%Y-%m-%d %H:%M UTC")
+    cell.value     = val
+    cell.font      = Font(size=9)
+    cell.fill      = PatternFill("solid", start_color=fill)
+    cell.alignment = Alignment(horizontal="left", vertical="center")
+    cell.border    = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-def _write_df_to_sheet(ws, df: pd.DataFrame, start_row=1):
-    """Write a DataFrame to a worksheet with styling."""
+def write_df(ws, df, start_row=1):
     for ci, col in enumerate(df.columns, 1):
-        cell = ws.cell(row=start_row, column=ci, value=col)
-        _header_style(cell)
-        ws.column_dimensions[get_column_letter(ci)].width = max(18, len(str(col)) + 4)
-
+        c = ws.cell(row=start_row, column=ci, value=col)
+        hdr(c)
+        ws.column_dimensions[get_column_letter(ci)].width = max(16, len(str(col)) + 4)
     for ri, row in enumerate(df.itertuples(index=False), start_row + 1):
-        fill_color = LGRAY if ri % 2 == 0 else WHITE
+        side = None
+        if "side" in df.columns:
+            side = getattr(row, "side", None)
         for ci, val in enumerate(row, 1):
-            # Format datetimes
-            if isinstance(val, datetime):
-                val = val.strftime("%Y-%m-%d %H:%M UTC")
-            cell = ws.cell(row=ri, column=ci, value=val)
-            cell.fill      = PatternFill("solid", start_color=fill_color)
-            cell.border    = _thin_border()
-            cell.alignment = Alignment(horizontal="left", vertical="center")
-
+            data_cell(ws.cell(row=ri, column=ci), val, ri, side=side)
     ws.freeze_panes = ws.cell(row=start_row + 1, column=1)
     ws.auto_filter.ref = ws.dimensions
 
 
-def build_excel(all_trades: dict, all_predictions: dict, wallet_stats: dict):
+def build_excel(all_data: dict):
     wb = Workbook()
-    wb.remove(wb.active)  # remove default sheet
+    wb.remove(wb.active)
 
-    # ── Summary sheet ─────────────────────────────────────────────────────────
-    ws_sum = wb.create_sheet("Summary")
-    ws_sum.sheet_view.showGridLines = False
-
-    ws_sum["A1"] = "Polymarket Wallet Intelligence Report"
-    ws_sum["A1"].font = Font(bold=True, size=16, color=BLUE[2:])
-    ws_sum["A2"] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
-    ws_sum["A2"].font = Font(italic=True, size=10)
+    # ── Summary ───────────────────────────────────────────────────────────────
+    ws = wb.create_sheet("Summary")
+    ws["A1"] = "Polymarket Wallet Intelligence"
+    ws["A1"].font = Font(bold=True, size=16, color=NAVY)
+    ws["A2"] = f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}"
+    ws["A2"].font = Font(italic=True, size=9, color="888888")
 
     row = 4
-    for wallet, stats in wallet_stats.items():
-        ws_sum.cell(row=row, column=1, value=f"Wallet: {wallet}").font = Font(bold=True, size=12)
+    for wallet, d in all_data.items():
+        ws.cell(row=row, column=1, value=f"Wallet: {wallet}").font = Font(bold=True, size=11, color=NAVY)
         row += 1
-        for k, v in stats.items():
-            label_cell = ws_sum.cell(row=row, column=1, value=k.replace("_", " ").title())
-            label_cell.font = Font(bold=True)
+        for k, v in d["stats"].items():
+            ws.cell(row=row, column=1, value=k.replace("_", " ").title()).font = Font(bold=True, size=9)
             val = v.strftime("%Y-%m-%d %H:%M UTC") if isinstance(v, datetime) else v
-            ws_sum.cell(row=row, column=2, value=round(val, 4) if isinstance(val, float) else val)
+            ws.cell(row=row, column=2, value=val).font = Font(size=9)
             row += 1
-        row += 1
+        row += 2
 
-    ws_sum.column_dimensions["A"].width = 22
-    ws_sum.column_dimensions["B"].width = 35
+    ws.column_dimensions["A"].width = 22
+    ws.column_dimensions["B"].width = 30
 
-    # ── Per-wallet trade history + predictions ─────────────────────────────────
-    for wallet in WALLETS:
+    # ── Per wallet sheets ─────────────────────────────────────────────────────
+    for wallet, d in all_data.items():
         short = wallet[:8]
+        df    = d["trades"]
 
-        # Trade history
-        df = all_trades.get(wallet, pd.DataFrame())
+        # Trades sheet
         ws_t = wb.create_sheet(f"Trades {short}")
         if not df.empty:
-            display_cols = ["timestamp", "market_name", "side", "outcome",
-                            "price", "size", "status", "condition_id"]
-            display_cols = [c for c in display_cols if c in df.columns]
-            _write_df_to_sheet(ws_t, df[display_cols])
+            cols = ["timestamp", "market_name", "side", "outcome",
+                    "price", "implied_prob", "size_usdc", "value_usdc",
+                    "condition_id", "tx_hash"]
+            cols = [c for c in cols if c in df.columns]
+            write_df(ws_t, df[cols])
         else:
-            ws_t["A1"] = "No trades found"
+            ws_t["A1"] = "No trades found for this wallet."
 
-        # Predictions
-        preds = all_predictions.get(wallet, pd.DataFrame())
-        ws_p = wb.create_sheet(f"Predictions {short}")
+        # Predictions sheet
+        preds = d["predictions"]
+        ws_p  = wb.create_sheet(f"Predict {short}")
         ws_p["A1"] = f"Next Market Predictions — {wallet}"
-        ws_p["A1"].font = Font(bold=True, size=13, color=BLUE[2:])
-        ws_p["A2"] = (
-            "Confidence Score = recency-weighted trade frequency. "
-            "Higher = more likely next entry."
-        )
-        ws_p["A2"].font = Font(italic=True, size=9)
+        ws_p["A1"].font = Font(bold=True, size=12, color=NAVY)
+        ws_p["A2"] = "Confidence Score = recency-weighted trade frequency. Higher = more likely next entry."
+        ws_p["A2"].font = Font(italic=True, size=8, color="666666")
+        ws_p.row_dimensions[1].height = 18
 
         if not preds.empty:
-            _write_df_to_sheet(ws_p, preds, start_row=4)
-            # Highlight top prediction
+            write_df(ws_p, preds, start_row=4)
+            # Gold highlight for top prediction
             for ci in range(1, len(preds.columns) + 1):
-                cell = ws_p.cell(row=5, column=ci)
-                cell.fill = PatternFill("solid", start_color=GOLD)
-                cell.font = Font(bold=True)
+                c = ws_p.cell(row=5, column=ci)
+                c.fill = PatternFill("solid", start_color=GOLD)
+                c.font = Font(bold=True, size=9)
         else:
-            ws_p["A4"] = "Insufficient data for predictions"
+            ws_p["A4"] = "Not enough trade history to generate predictions."
 
     wb.save(EXCEL_PATH)
     print(f"\n✅ Excel saved → {EXCEL_PATH}")
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def run():
     print(f"\n{'='*60}")
     print(f"  Polymarket Tracker — {datetime.now().strftime('%Y-%m-%d %H:%M')} UTC")
-    print(f"{'='*60}")
+    print(f"{'='*60}\n")
 
-    all_trades      = {}
-    all_predictions = {}
-    wallet_stats    = {}
+    all_data = {}
 
     for wallet in WALLETS:
-        print(f"\n📍 Wallet: {wallet}")
+        print(f"📍 Wallet: {wallet}")
+        print("  Fetching trades from Data API...")
 
-        print("  Fetching CLOB trade history...")
-        raw = fetch_trades_clob(wallet)
+        raw = fetch_trades(wallet)
         print(f"  → {len(raw)} raw trades")
 
         df = parse_trades(raw, wallet)
-        df = enrich_with_market_names(df)
+        df = enrich_market_names(df)
 
-        all_trades[wallet]   = df
-        wallet_stats[wallet] = compute_wallet_stats(df)
-
-        print("  Running prediction model...")
+        stats = wallet_stats(df)
         preds = predict_next_markets(df, top_n=10)
-        all_predictions[wallet] = preds
+
+        all_data[wallet] = {"trades": df, "stats": stats, "predictions": preds}
+
+        print(f"  Stats: {stats.get('total_trades', 0)} trades across "
+              f"{stats.get('unique_markets', 0)} markets")
 
         if not preds.empty:
-            print(f"\n  🔮 Top 3 predicted next markets:")
+            print(f"\n  🔮 Top predictions:")
             for _, r in preds.head(3).iterrows():
-                print(f"     • {r['Market'][:60]}")
-                print(f"       Entry odds: {r['Predicted Entry (odds)']}  |  Likely: {r['Likely Outcome']}")
+                print(f"     • {str(r['Market'])[:55]}")
+                print(f"       Entry: {r['Predicted Entry (odds)']}  |  Outcome: {r['Likely Outcome']}")
+        print()
 
-    build_excel(all_trades, all_predictions, wallet_stats)
-
-
-def schedule_run():
-    """Run once now, then every 6 hours."""
-    run()
-    schedule.every(6).hours.do(run)
-    print("\n⏰ Scheduled to refresh every 6 hours. Ctrl+C to stop.")
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    build_excel(all_data)
 
 
 if __name__ == "__main__":
+    import schedule
+
     mode = os.environ.get("RUN_MODE", "once")
     if mode == "scheduled":
-        schedule_run()
+        run()
+        schedule.every(6).hours.do(run)
+        print("\n⏰ Scheduled every 6 hours. Ctrl+C to stop.")
+        while True:
+            schedule.run_pending()
+            time.sleep(60)
     else:
         run()
